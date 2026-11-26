@@ -188,6 +188,31 @@ FrameMetadata get_frame_metadata(const AVFrame& av_frame) {
   const char* color_trc_name = av_color_transfer_name(av_frame.color_trc);
 
   FrameMetadata result;
+  switch (av_frame.pict_type) {
+    case AV_PICTURE_TYPE_I:
+      result.pict_type = "I";
+      break;
+    case AV_PICTURE_TYPE_P:
+      result.pict_type = "P";
+      break;
+    case AV_PICTURE_TYPE_B:
+      result.pict_type = "B";
+      break;
+    case AV_PICTURE_TYPE_S:
+      result.pict_type = "S";
+      break;
+    case AV_PICTURE_TYPE_SI:
+      result.pict_type = "SI";
+      break;
+    case AV_PICTURE_TYPE_SP:
+      result.pict_type = "SP";
+      break;
+    case AV_PICTURE_TYPE_BI:
+      result.pict_type = "BI";
+      break;
+    default:
+      result.pict_type = "UNKNOWN";
+  }
   result.pixel_format = get_pix_fmt_name(av_frame);
   result.color_space = color_space_name ? color_space_name : "unknown";
   result.color_range = color_range_name ? color_range_name : "unknown";

@@ -88,6 +88,7 @@ class FORCE_PUBLIC_VISIBILITY PacketDecoder {
 // How a decoded frame's samples are laid out and how they should be
 // interpreted, before any color conversion.
 struct FrameMetadata {
+  std::string pict_type;
   std::string pixel_format;
   std::string color_space;
   std::string color_range;

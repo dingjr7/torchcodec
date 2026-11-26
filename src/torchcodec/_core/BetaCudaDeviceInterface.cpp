@@ -4,6 +4,7 @@
 // This source code is licensed under the BSD-style license found in the
 // LICENSE file in the root directory of this source tree.
 
+#include <array>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -31,6 +32,88 @@ extern "C" {
 namespace facebook::torchcodec {
 
 namespace {
+
+// NVDEC exposes the H.264 slice header at decode time. Its reference flag
+// alone cannot distinguish P pictures from reference B pictures.
+AVPictureType h264_picture_type(const CUVIDPICPARAMS& picture) {
+  if (!picture.nNumSlices || !picture.pSliceDataOffsets ||
+      !picture.pBitstreamData) {
+    return AV_PICTURE_TYPE_NONE;
+  }
+  unsigned int start = picture.pSliceDataOffsets[0];
+  const unsigned int end = picture.nNumSlices > 1 ? picture.pSliceDataOffsets[1]
+                                                  : picture.nBitstreamDataLen;
+  if (end > picture.nBitstreamDataLen || start >= end) {
+    return AV_PICTURE_TYPE_NONE;
+  }
+  const auto* data = picture.pBitstreamData;
+  // Accept a slice starting at the NAL header or at its Annex B start code.
+  if (data[start] == 0) {
+    while (start < end && data[start] == 0) {
+      ++start;
+    }
+    if (start == end || data[start++] != 1) {
+      return AV_PICTURE_TYPE_NONE;
+    }
+  }
+  if (start == end) {
+    return AV_PICTURE_TYPE_NONE;
+  }
+  const int nal_type = data[start++] & 0x1f;
+  if (nal_type != 1 && nal_type != 2 && nal_type != 5) {
+    return AV_PICTURE_TYPE_NONE;
+  }
+
+  // Only first_mb_in_slice and slice_type (two unsigned Exp-Golomb codes)
+  // are needed. Unescape just their bounded prefix into RBSP bytes.
+  std::array<uint8_t, 12> prefix{};
+  size_t bytes = 0;
+  int zeros = 0;
+  while (start < end && bytes < prefix.size()) {
+    uint8_t b = data[start++];
+    if (zeros == 2 && b == 3) {
+      zeros = 0;
+      continue;
+    }
+    prefix[bytes++] = b;
+    zeros = b == 0 ? zeros + 1 : 0;
+  }
+  size_t bit = 0;
+  auto next_bit = [&]() {
+    auto i = bit++;
+    return (prefix[i / 8] >> (7 - i % 8)) & 1;
+  };
+  auto read_ue = [&]() -> std::optional<unsigned int> {
+    unsigned int leading = 0;
+    while (bit < bytes * 8) {
+      if (next_bit()) {
+        if (bit + leading > bytes * 8) {
+          break;
+        }
+        unsigned int value = 1;
+        for (unsigned int i = 0; i < leading; ++i) {
+          value = (value << 1) | next_bit();
+        }
+        return value - 1;
+      }
+      if (++leading > 31) {
+        break;
+      }
+    }
+    return std::nullopt;
+  };
+  if (!read_ue()) {
+    return AV_PICTURE_TYPE_NONE;
+  }
+  const auto slice = read_ue();
+  constexpr AVPictureType types[] = {
+      AV_PICTURE_TYPE_P,
+      AV_PICTURE_TYPE_B,
+      AV_PICTURE_TYPE_I,
+      AV_PICTURE_TYPE_SP,
+      AV_PICTURE_TYPE_SI};
+  return slice && *slice <= 9 ? types[*slice % 5] : AV_PICTURE_TYPE_NONE;
+}
 
 // Per-device cache for cuvidGetDecoderCaps results.
 // The key is a tuple of (device index, codec type, chroma format, bit depth
@@ -887,6 +970,12 @@ int BetaCudaDeviceInterface::frame_ready_for_decoding(
   //   pictures pending in the decode queue.
   CUresult result = cuvidDecodePicture(*decoder_.get(), pic_params);
 
+  if (result == CUDA_SUCCESS && mode() == Mode::DecoderOnly &&
+      video_format_.codec == cudaVideoCodec_H264 && !pic_params->second_field) {
+    surface_picture_types_[pic_params->CurrPicIdx] =
+        h264_picture_type(*pic_params);
+  }
+
   // Yes, you're reading that right, 0 means error, 1 means success
   return (result == CUDA_SUCCESS);
 }
@@ -897,7 +986,10 @@ int BetaCudaDeviceInterface::frame_ready_in_display_order(
     disp_info->timestamp = pending_pts_.front();
     pending_pts_.pop();
   }
-  ready_frames_.push(*disp_info);
+  auto entry = surface_picture_types_.find(disp_info->picture_index);
+  auto type = entry == surface_picture_types_.end() ? AV_PICTURE_TYPE_NONE
+                                                    : entry->second;
+  ready_frames_.push({*disp_info, type});
   return 1; // success
 }
 
@@ -911,7 +1003,7 @@ int BetaCudaDeviceInterface::receive_frame(UniqueAVFrame& av_frame) {
   // Drop those packets that were marked as discard. We only wanted to decode
   // those, not to return them.
   while (!ready_frames_.empty() &&
-         discarded_timestamps_.erase(ready_frames_.front().timestamp) > 0) {
+         discarded_timestamps_.erase(ready_frames_.front().info.timestamp) > 0) {
     ready_frames_.pop();
   }
 
@@ -921,7 +1013,7 @@ int BetaCudaDeviceInterface::receive_frame(UniqueAVFrame& av_frame) {
     return eof_sent_ ? AVERROR_EOF : AVERROR(EAGAIN);
   }
 
-  CUVIDPARSERDISPINFO disp_info = ready_frames_.front();
+  auto [disp_info, pict_type] = ready_frames_.front();
   ready_frames_.pop();
 
   CUVIDPROCPARAMS proc_params = {};
@@ -974,6 +1066,7 @@ int BetaCudaDeviceInterface::receive_frame(UniqueAVFrame& av_frame) {
   nvdec_surface_ready_.record(nvdec_output_stream_);
 
   av_frame = convert_cuda_frame_to_av_frame(frame_ptr, pitch, disp_info);
+  av_frame->pict_type = pict_type;
 
   return AVSUCCESS;
 }
@@ -1256,7 +1349,8 @@ void BetaCudaDeviceInterface::flush() {
   send_eof_packet();
   eof_sent_ = false;
 
-  std::queue<CUVIDPARSERDISPINFO> empty_queue;
+  surface_picture_types_.clear();
+  decltype(ready_frames_) empty_queue;
   std::swap(ready_frames_, empty_queue);
   discarded_timestamps_.clear();
 

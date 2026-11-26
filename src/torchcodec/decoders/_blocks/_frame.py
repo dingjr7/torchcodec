@@ -18,6 +18,7 @@ from ._helpers import _process_local
 
 class _Metadata(NamedTuple):
     # The fields of the `_blocks_frame_metadata` op, in order.
+    pict_type: str
     pixel_format: str
     color_space: str
     color_range: str
@@ -138,6 +139,15 @@ class RawFrame:
         if self._metadata is None:
             self._metadata = _Metadata(*_blocks_frame_metadata(self._handle))
         return self._metadata
+
+    @property
+    def pict_type(self) -> str:
+        """The coded picture type: I, P, B, S, SI, SP, BI, or UNKNOWN.
+
+        The native NVDEC backend reports this for H.264. Other native
+        NVDEC codecs return UNKNOWN. FFmpeg reports its AVFrame picture type.
+        """
+        return self._get_metadata().pict_type
 
     @property
     def pixel_format(self) -> str:

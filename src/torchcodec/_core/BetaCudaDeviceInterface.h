@@ -157,7 +157,14 @@ class BetaCudaDeviceInterface : public DeviceInterface {
   CUVIDEOFORMAT video_format_ = {};
   CUVIDEOFORMATEX parser_ext_info_ = {};
 
-  std::queue<CUVIDPARSERDISPINFO> ready_frames_;
+  // Key by decode surface, then snapshot the type at display time before NVDEC
+  // can recycle that surface. PTS may be missing or duplicated.
+  std::unordered_map<int, AVPictureType> surface_picture_types_;
+  struct DisplayPicture {
+    CUVIDPARSERDISPINFO info;
+    AVPictureType type;
+  };
+  std::queue<DisplayPicture> ready_frames_;
 
   // Whether we track the pts ourselves, instead of relying on the NVCUVID
   // parser.
